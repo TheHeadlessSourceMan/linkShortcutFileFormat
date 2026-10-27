@@ -1,0 +1,19 @@
+[project]
+name="authorsDashboardProjectPlugin"
+version="1.0.0.0"
+description = "Extract project info from author dashboards"
+readme="README.md"
+requires-python = ">= 3.8"
+authors = [{name = "KC Eilander"}]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords=[]
+
+[tool.setuptools.package-dir]
+authorsDashboardProjectPlugin = "."
+
+[project.urls]
+Homepage = "https://github.com/TheHeadlessSourceMan/projectMud"
+
+[project.entry-points."projectMud.plugin"]
+authorsDashboardProjectPlugin='authorsDashboardProjectPlugin:AuthorsDashboardProjectPlugin'

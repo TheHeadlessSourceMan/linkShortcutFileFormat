@@ -1,7 +1,17 @@
+"""
+Deprecated/untested shortcut tools kept for reference
+"""
+from typing import Optional
+
         
-def makeShortcutsRelative(path,recursive=False,constrainTo=None,dryRun=False):
+def makeShortcutsRelative(path:str,recursive:bool=False,constrainTo:Optional[str]=None,dryRun:bool=False)->None:
     """
     Convert shortcuts from absolute to relative (if possible)
+
+    :param path: where to start searching for shortcuts
+    :param recursive: True/False whether to search sub-directories
+    :param constrainTo: only change targets starting with this path (default is the drive of path)
+    :param dryRun: True/False only report what would change
     """
     linkFinderGenerator=findAll(path,yeild_files=False,yeild_shortcuts=True,recursive=recursive)
     if constrainTo is None or constrainTo=='': # must at least be in the same drive letter
@@ -37,11 +47,14 @@ def makeShortcutsRelative(path,recursive=False,constrainTo=None,dryRun=False):
                 print('skipping:',fromPath+' => '+toPath)
                 print('\t(it must start with "'+constrainTo+'")')
 
-def makeShortcutsAbsolute(shortcut,dryRun=False):
+def makeShortcutsAbsolute(shortcut:str,dryRun:bool=False)->None:
     """
     Convert shortcuts from relative to absolute
     
     TODO: Not yet tested!!!
+
+    :param shortcut: path of the shortcut to convert
+    :param dryRun: True/False only report what would change
     """
     sc=winshell.shortcut(shortcut)
     if sc.startswith('%CD%'):
@@ -50,7 +63,7 @@ def makeShortcutsAbsolute(shortcut,dryRun=False):
             sc.path=newPath
             sc.write()
             
-def convertShortcutToSymlink(shortcut):
+def convertShortcutToSymlink(shortcut:str)->None:
     """
     Attempt to convert a lnk file into a NTFS "Junction"
     (equivalent to a symlink on real OSes)
@@ -60,6 +73,8 @@ def convertShortcutToSymlink(shortcut):
     
     UNTESTED!!!!!
     Also, may not work correctly for all things, for example shortcuts with parameters.
+
+    :param shortcut: path of the lnk file to convert
     """
     import win32file
     sc=winshell.shortcut(shortcut) # http://winshell.readthedocs.org/en/latest/shortcuts.html
@@ -83,6 +98,9 @@ if False:
     #
     #    NOT tested!
     def CreateLink(nFolder):
+        """
+        :param nFolder: CSIDL of the special folder to create the link in
+        """
         UpdateData(TRUE) 
         #Check for empty strings ...
         if(m_strItem.IsEmpty() || m_strFile.IsEmpty())

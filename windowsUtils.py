@@ -3,12 +3,20 @@
 """
 Useful windows utilities
 """
+import typing
 import os
 
-
-def osEnquote(path):
+@typing.overload
+def osEnquote(path:None)->None:
+    ...
+@typing.overload
+def osEnquote(path:str)->str:
+    ...
+def osEnquote(path:typing.Optional[str])->typing.Optional[str]:
     """
     Wrap path in quotes if necessary
+
+    :param path: the path to quote
     """
     if not path:
         return path
@@ -18,9 +26,12 @@ def osEnquote(path):
     return path
 
 
-def uncToPath(unc,translateForwardSlashes=True):
+def uncToPath(unc:str,translateForwardSlashes:bool=True)->str:
     """
     translate a unc path into a standard windows path
+
+    :param unc: the unc path
+    :param translateForwardSlashes: True/False convert / into \\
     """
     if translateForwardSlashes:
         unc=unc.replace('/','\\')
@@ -31,9 +42,12 @@ def uncToPath(unc,translateForwardSlashes=True):
     return unc
 
 
-def pathToUnc(path,translateForwardSlashes=True):
+def pathToUnc(path:str,translateForwardSlashes:bool=True)->str:
     """
     translate a file path into a unc path
+
+    :param path: the file path
+    :param translateForwardSlashes: True/False convert / into \\
     """
     if translateForwardSlashes:
         path=path.replace('/','\\')
@@ -44,7 +58,10 @@ def pathToUnc(path,translateForwardSlashes=True):
     return path
 
 
-def nextAvailableFilename(desiredFilename,ignore=None):
+def nextAvailableFilename(
+    desiredFilename:str,
+    ignore:typing.Union[None,str,typing.Iterable[str]]=None
+    )->str:
     """
     Given a desired filename, will always return the next unused rendition
     of it.
@@ -72,22 +89,26 @@ def nextAvailableFilename(desiredFilename,ignore=None):
             except ValueError:
                 continue
     if desiredFilename in ls:
-        parts[-1]=parts[-1].split('.',1)
-        if len(parts[-1])>1:
-            parts[-1][1]='.'+parts[-1][1]
+        first=parts[-1].split('.',1)
+        if len(first)>1:
+            first[1]='.'+first[1]
         else:
-            parts[-1].append('')
+            first.append('')
         i=1
         while desiredFilename in ls:
-            desiredFilename=parts[0]+os.sep+parts[-1][0]+' '+str(i)+parts[-1][1]
+            desiredFilename=os.sep.join([
+                parts[0],
+                first[0]+' '+str(i)+first[1]])
             i+=1
     return desiredFilename
 
 
-def hIconToPIL(hIcon):
+def hIconToPIL(hIcon:typing.Any)->typing.Any:
     """
     convert a windows icon handle into
     a useable PIL image
+
+    :param hIcon: windows icon handle
     """
     import win32api
     import win32ui
@@ -95,41 +116,47 @@ def hIconToPIL(hIcon):
     import win32con
     import PIL.Image
     ico_x = win32api.GetSystemMetrics(win32con.SM_CXICON)
-    hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+    hdc = win32ui.CreateDCFromHandle(
+        win32gui.GetDC(0)) # type: ignore
     hbmp = win32ui.CreateBitmap()
     hbmp.CreateCompatibleBitmap(hdc, ico_x, ico_x)
     hdc = hdc.CreateCompatibleDC()
     hdc.SelectObject(hbmp)
     hdc.DrawIcon((0, 0), hIcon)
-    win32gui.DestroyIcon(hIcon)
-    bmpinfo = hbmp.GetInfo()
+    win32gui.DestroyIcon(hIcon) # type: ignore
+    bmpinfo = hbmp.GetInfo() # type: ignore
     bmpstr = hbmp.GetBitmapBits(True)
     img = PIL.Image.frombuffer(
         "RGBA",
-        (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-        bmpstr, "raw", "BGRA", 0, 1
+        (bmpinfo["bmWidth"],bmpinfo["bmHeight"]), # type: ignore
+        bmpstr,"raw","BGRA",0,1
         )
     return img
 
 
-def iconForFiletype(path):
+def iconForFiletype(path:str)->typing.Any:
     """
     get a useable PIL image based on a file type
 
     :param path: file to get the icon for.  NOTE: this file
         doesn't need to actually exist if you want the icon for a type
     """
-    from win32com.shell import shell, shellcon
+    from win32com.shell import shell,shellcon # type: ignore
     from win32con import FILE_ATTRIBUTE_NORMAL
     extension='.'+path.rsplit('.',1)[-1]
-    flags = shellcon.SHGFI_SMALLICON | \
+    flags=shellcon.SHGFI_SMALLICON | \
         shellcon.SHGFI_ICON | \
         shellcon.SHGFI_USEFILEATTRIBUTES
-    _,info=shell.SHGetFileInfo(extension,FILE_ATTRIBUTE_NORMAL,flags)
-    return hIconToPIL(info[0])
+    _,info=shell.SHGetFileInfo( # type: ignore
+        extension,FILE_ATTRIBUTE_NORMAL,flags)
+    return hIconToPIL(info[0]) # type: ignore
 
 
-def iconImage(path='',index_sep=':',index_plus_one=True):
+def iconImage(
+    path:str='',
+    index_sep:typing.Optional[str]=':',
+    index_plus_one:bool=True
+    )->typing.Any:
     """
     get the icon for a given path.
 
@@ -144,8 +171,10 @@ def iconImage(path='',index_sep=':',index_plus_one=True):
             SHELL32.dll:0 -- hint: this is the default file icon
             :0 -- same as above
             or call with no path at all for the same thing
-    :param index_sep: path separator for files with multiple icons eg "foo.dll:21" (if None, do not use indexes)
-    :param index_plus_one: since windows uses 1 for the first icon, this lets us start at 0
+    :param index_sep: path separator for files with multiple icons
+        eg "foo.dll:21" (if None, do not use indexes)
+    :param index_plus_one: since windows uses 1 for the first icon,
+        this lets us start at 0
 
     NOTE: makes use of
         https://stackoverflow.com/questions/23263599/how-to-extract-128x128-icon-bitmap-data-from-exe-in-python
@@ -153,12 +182,12 @@ def iconImage(path='',index_sep=':',index_plus_one=True):
     import PIL.Image
     index=0
     if index_sep:
-        path=path.rsplit(os.sep,1)
-        path[-1]=path[-1].rsplit(index_sep,1)
-        if len(path[-1])>1:
-            index=int(path[-1][-1])
-        path[-1]=path[-1][0]
-        path=os.sep.join(path)
+        pathParts:typing.List[str]=path.rsplit(os.sep,1)
+        first=pathParts[-1].rsplit(index_sep,1)
+        if len(first)>1:
+            index=int(first[-1])
+        pathParts[-1]=first[0]
+        path=os.sep.join(pathParts)
     if index_plus_one:
         index+=1
     # make sure it's out there
@@ -172,32 +201,36 @@ def iconImage(path='',index_sep=':',index_plus_one=True):
             elif os.path.exists(sysroot+r'\System32'+os.sep+path):
                 path=sysroot+r'\System32'+os.sep+path
             else:
-                raise FileNotFoundError("[Errno 2] No such file or directory: '"+path+"'")
+                raise FileNotFoundError("[Errno 2] No such file or directory: '"+path+"'") # noqa: E501
         else:
-            raise FileNotFoundError("[Errno 2] No such file or directory: '"+path+"'")
+            raise FileNotFoundError("[Errno 2] No such file or directory: '"+path+"'") # noqa: E501
     # if it's an ico file, load it.
     if path.endswith('.ico'):
         return PIL.Image.open(path)
     # No?  Okay, load as a dll.
-    import win32api,win32gui,win32ui,win32con
-    large,small=win32gui.ExtractIconEx(path,index)
-    win32gui.DestroyIcon(small[0])
-    hIcon=large[0]
+    import win32api
+    import win32gui
+    import win32ui
+    import win32con
+    large,small=win32gui.ExtractIconEx(path,index) # type: ignore
+    win32gui.DestroyIcon(small[0]) # type: ignore
+    hIcon=large[0] # type: ignore
     ico_x=win32api.GetSystemMetrics(win32con.SM_CXICON)
     ico_y=win32api.GetSystemMetrics(win32con.SM_CYICON)
-    hdc=win32ui.CreateDCFromHandle(win32gui.GetDC(0))
+    hdc=win32ui.CreateDCFromHandle(
+        win32gui.GetDC(0)) # type: ignore
     hbmp=win32ui.CreateBitmap()
     hbmp.CreateCompatibleBitmap(hdc,ico_x,ico_y)
     hdc=hdc.CreateCompatibleDC()
     hdc.SelectObject(hbmp)
-    hdc.DrawIcon((0,0),hIcon)
-    win32gui.DestroyIcon(hIcon)
+    hdc.DrawIcon((0,0),hIcon) # type: ignore
+    win32gui.DestroyIcon(hIcon) # type: ignore
     bitmapbits=hbmp.GetBitmapBits(True)
     img=PIL.Image.frombuffer('RGBA',(ico_x,ico_y),bitmapbits,'raw','BGRA',0,1)
     return img
 
 
-def cmdline(args):
+def cmdline(args:typing.Iterable[str])->int:
     """
     Run the command line
 
@@ -237,10 +270,12 @@ def cmdline(args):
         print('  windowsUtils.py [options]')
         print('Options:')
         print('   --osEnquote=path ................. test os filename quoting')
-        print('   --nextAvailableFilename=path ..... given a filename, get the next available rendition')
-        print('   --viewIcon=path.dll[:index] ...... find and view a given icon')
+        print('   --nextAvailableFilename=path ..... given a filename, get the next available rendition') # noqa: E501
+        print('   --viewIcon=path.dll[:index] ...... find and view a given icon') # noqa: E501
+        return -1
+    return 0
 
 
 if __name__=='__main__':
     import sys
-    cmdline(sys.argv[1:])
+    sys.exit(cmdline(sys.argv[1:]))

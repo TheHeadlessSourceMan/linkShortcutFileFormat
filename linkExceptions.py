@@ -3,14 +3,18 @@
 """
 Exceptions associated with links
 """
+from typing import Sequence
+
 
 class LinkException(Exception):
     """
     Base class used for announcing errors concerning file links
     """
-    def __init__(self,msg):
+    def __init__(self,msg:str)->None:
         """
         Create the exception
+
+        :param msg: the error message
         """
         Exception.__init__(self,msg)
 
@@ -19,16 +23,22 @@ class RecursiveLinkException(LinkException):
     """
     Following a link to its destination would result in an infinite loop
     """
-    def __init__(self,problemPath):
+    def __init__(self,problemPath:Sequence[str])->None:
+        """
+        :param problemPath: the chain of paths that forms the loop
+        """
         fullPath=('\n  => '.join(['"'+path+'"' for path in problemPath]))
-        LinkException.__init__(self,'ERR: Recursive link detected:\n  => '+fullPath)
+        LinkException.__init__(self,'ERR: Recursive link detected:\n  => '+fullPath) # noqa: E501
 
 
 class NotALinkException(LinkException):
     """
     Tried to address something that is not a link
     """
-    def __init__(self,linkPath):
+    def __init__(self,linkPath:str)->None:
+        """
+        :param linkPath: the path that is not a link
+        """
         LinkException.__init__(self,'ERR: Not a valid link "'+linkPath+'"')
 
 
@@ -36,11 +46,14 @@ class BrokenLinkException(LinkException):
     """
     The target of a link has gone missing
     """
-    def __init__(self,linkPath):
+    def __init__(self,linkPath:str)->None:
+        """
+        :param linkPath: the path of the broken link
+        """
         LinkException.__init__(self,'ERR: Broken link "'+linkPath+'"')
 
 
-def cmdline(args):
+def cmdline(args:Sequence[str])->None:
     """
     Run the command line
 

@@ -3,17 +3,23 @@
 """
 Types of links
 """
+import typing
 
-LINKTYPE_ANY=-1 # Used for searching.  You will never encounter a file of LINKTYPE_ANY.
-LINKTYPE_NONLINK=0
+
+LINKTYPE_ANY=-1 # Used for searching.  You will never encounter a file of LINKTYPE_ANY. # noqa: E501
+LINKTYPE_NONLINK_LINK=0
+LINKTYPE_NONLINK=LINKTYPE_NONLINK_LINK
 LINKTYPE_SHORTCUT=1
 LINKTYPE_FOLDER_SHORTCUT=2
 LINKTYPE_JUNCTION=3
 LINKTYPE_HARD_LINK=4
+LINKTYPE_HARD=LINKTYPE_HARD_LINK
 LINKTYPE_SOFT_LINK=5
+LINKTYPE_SOFT=LINKTYPE_SOFT_LINK
 LINKTYPE_SYMBOLIC_LINK=6
+LINKTYPE_SYMBOLIC=LINKTYPE_SYMBOLIC_LINK
 
-LINK_TYPES=[
+LINK_TYPES:typing.List[str]=[
     'Not a link', # 0
     'Shortcut', # 1
     'Folder Shortcut', # 2
@@ -22,11 +28,15 @@ LINK_TYPES=[
     'Soft Link', # 5
     'Symbolic Link', # 6
     ]
-    
-def LinkTypeOf(something):
+
+
+class HasLinkType(typing.Protocol):
+    linkType:typing.Union[int,bool,str]
+
+def LinkTypeOf(something:typing.Union[int,bool,str,HasLinkType])->int:
     """
     Get the link type of something.
-    
+
     :param something: can be
         * class with a linkType member (e.g. a Link object)
         * an integer link type
@@ -37,7 +47,7 @@ def LinkTypeOf(something):
             * a name similar to of one of the linktype constant names
     """
     if hasattr(something,'linkType'):
-        return something.linkType
+        return LinkTypeOf(something.linkType) # type: ignore
     if isinstance(something,bool):
         if something:
             return LINKTYPE_ANY
@@ -46,9 +56,14 @@ def LinkTypeOf(something):
         if something>LINKTYPE_SYMBOLIC_LINK or something<LINKTYPE_ANY:
             raise Exception('Link type out of bounds!')
         return something
-    if not isinstance(something,str) or not str:
+    if not isinstance(something,str) or not something:
         raise Exception('Unable to convert this item to a link type')
-    something=something.replace('_','').replace(' ','').lower().replace('linktype','').replace('link','')
+    something=something\
+        .replace('_','')\
+        .replace(' ','')\
+        .lower()\
+        .replace('linktype','')\
+        .replace('link','')
     if something in ('any','-1'):
         return LINKTYPE_ANY
     if something in ('non','0'):

@@ -6,12 +6,25 @@ Run unit tests
 See:
     http://pyunit.sourceforge.net/pyunit.html
 """
+import typing
 import unittest
 import os
 import shutil
-from linkShortcut import *
+from PIL import Image
+from linkShortcutFileFormat import (
+    createLink,findBrokenShortcuts,
+    LINKTYPE_FOLDER_SHORTCUT,LINKTYPE_SHORTCUT,
+    findAll,WindowsLink)
+from linkShortcutFileFormat.windowsUtils import nextAvailableFilename
 
-def compareImage(img1,img2):
+
+def compareImage(img1:Image.Image,img2:Image.Image)->bool:
+    """
+    Check whether two PIL images are identical
+
+    :param img1: first image
+    :param img2: second image
+    """
     import PIL.ImageChops
     return PIL.ImageChops.difference(img1,img2).getbbox() is None
 
@@ -23,20 +36,29 @@ class Test(unittest.TestCase):
     Run unit test
     """
 
-    def setUp(self):
+    def setUp(self)->None:
+        """
+        Start each test with an empty results directory
+        """
         os.chdir(__HERE__)
         try:
             shutil.rmtree(results_dir)
-        except:
+        except Exception:
             pass
         os.mkdir(results_dir)
 
-    def tearDown(self):
-        pass# shutil.rmtree(results_dir)
+    def tearDown(self)->None:
+        """
+        Leave results in place for inspection
+        """
+        pass # shutil.rmtree(results_dir)
 
-    def toFolderShortcut(self):
+    def toFolderShortcut(self)->None:
+        """
+        Test converting a shortcut into a folder shortcut
+        """
         print()
-        required=['linkToFolder.lnk','targetFolder']
+        required:typing.List[str]=['linkToFolder.lnk','targetFolder']
         f='linkToFolder.lnk'
         shutil.copy2(__HERE__+f,results_dir+f)
         f='targetFolder'
@@ -53,12 +75,18 @@ class Test(unittest.TestCase):
         print('   ',lnk2.targetPath)
         assert lnk2.targetPath==results_dir+'targetFolder'
 
-    def fromFolderShortcut(self):
+    def fromFolderShortcut(self)->None:
+        """
+        Test creating a folder shortcut and converting it back into a shortcut
+        """
         print()
         f='targetFolder'
         shutil.copytree(__HERE__+f,results_dir+f)
         print('creating new folder shortcut')
-        lnk=createLink(results_dir+f,linkType=LINKTYPE_FOLDER_SHORTCUT,shortcutName=results_dir+'testFolderShortcut')
+        lnk=createLink(
+            results_dir+f,
+            linkType=LINKTYPE_FOLDER_SHORTCUT,
+            shortcutName=results_dir+'testFolderShortcut')
         print('   ',lnk.path)
         print('    - links to -')
         print('   ',lnk.targetPath)
@@ -73,25 +101,43 @@ class Test(unittest.TestCase):
         assert lnk2.targetPath==results_dir+'targetFolder'
         assert str(lnk2) # verify __repr__() function
 
-    def makeShortcutRelative(self):
+    def makeShortcutRelative(self)->None:
+        """
+        Test making a shortcut relative (not implemented)
+        """
         assert False
 
-    def makeShortcutAbsolute(self):
+    def makeShortcutAbsolute(self)->None:
+        """
+        Test making a shortcut absolute (not implemented)
+        """
         assert False
 
-    def shortcutToSymlink(self):
+    def shortcutToSymlink(self)->None:
+        """
+        Test converting a shortcut to a symlink (not implemented)
+        """
         assert False
 
-    def findBrokenShortcuts(self):
+    def findBrokenShortcuts(self)->None:
+        """
+        Test finding broken shortcuts (not implemented)
+        """
         broke=findBrokenShortcuts('.',recursive=True)
         # TODO:
         assert False
 
-    def fixBrokenShortcuts(self):
+    def fixBrokenShortcuts(self)->None:
+        """
+        Test fixing broken shortcuts (not implemented)
+        """
         fixBrokenShortcuts(path,recursive=True,dryRun=True)
         assert False
 
-    def finalPath(self):
+    def finalPath(self)->None:
+        """
+        Test resolving links to their final target
+        """
         print()
         links=[ # (linkName, desiredTargetFilename)
             (os.path.abspath('targetFile.txt'),'targetFile.txt'),
@@ -107,7 +153,10 @@ class Test(unittest.TestCase):
             print(linkName,':\n\t',path,'\n\t',desiredTargetFilename)
             assert path==desiredTargetFilename
 
-    def icons(self):
+    def icons(self)->None:
+        """
+        Test reading a shortcut's icon
+        """
         print()
         linkName='linkToFile'
         iconFile=r'%SystemRoot%\system32\SHELL32.dll'
@@ -117,7 +166,10 @@ class Test(unittest.TestCase):
         assert link.iconFile==iconFile
         assert link.iconNumber==iconNumber
 
-    def comments(self):
+    def comments(self)->None:
+        """
+        Test reading a shortcut's comment
+        """
         print()
         linkName='linkToFile'
         comment=r'SAMPLE COMMENT'
@@ -125,14 +177,19 @@ class Test(unittest.TestCase):
         print(linkName,':\n\t',link.comment)
         assert link.comment==comment
 
-    def osEnquote(self):
+    def osEnquote(self)->None:
+        """
+        Test quoting of paths containing spaces
+        """
         print()
-        enquotes=[ # (input,expected)
+        enquotes:typing.List[typing.Tuple[
+            typing.Optional[str],typing.Optional[str]]]\
+            =[ # (input,expected)
             (None,None),
             (r'hello.txt',r'hello.txt'),
             (r'hello world.txt',r'"hello world.txt"'),
             (r'"hello world.txt"',r'"hello world.txt"'),
-            #(r'hello "world".txt',r'"hello \"world\".txt"'), #TODO: not working!
+            #(r'hello "world".txt',r'"hello \"world\".txt"'), #TODO: not working! # noqa: E501
         ]
         for input,expected in enquotes:
             quoted=osEnquote(input)
@@ -142,7 +199,10 @@ class Test(unittest.TestCase):
             print()
             assert quoted==expected
 
-    def nextAvailableFilename(self):
+    def nextAvailableFilename(self)->None:
+        """
+        Test generating unused filenames
+        """
         print()
         # create needed files
         create=['B.txt','C.txt','C 1.txt']
@@ -167,12 +227,32 @@ class Test(unittest.TestCase):
             result=nextAvailableFilename(input,ignore='junk')
             print(result)
             assert result==expected
-        
-            
-    def find(self):
+
+    def find(self)->None:
+        """
+        Test searching for files and links
+        """
         print()
-        tests=[ # ([results],[params])
-            ([r'folderShortcut',r'linkToFile.lnk',r'linkToFolder.lnk',r'linkToLink.lnk',r'results',r'targetFile.txt',r'targetFolder',r'test.py',r'__init__.py',r'linkToFile.lnk',r'linkToLink.lnk',r'targetFile.txt',r'test.py',r'__init__.py',r'targetFolder\targetFolderFile.txt',r'targetFolder\targetFolderFile.txt'],[None,MATCH_TYPE_GLOB,True,True,True,True,True])
+        tests:typing.List[typing.Tuple[
+            typing.List[str],typing.List[typing.Any]]]=[ # ([results],[params])
+            ([
+                r'folderShortcut',
+                r'linkToFile.lnk',
+                r'linkToFolder.lnk',
+                r'linkToLink.lnk',
+                r'results',
+                r'targetFile.txt',
+                r'targetFolder',
+                r'test.py',
+                r'__init__.py',
+                r'linkToFile.lnk',
+                r'linkToLink.lnk',
+                r'targetFile.txt',
+                r'test.py',
+                r'__init__.py',
+                r'targetFolder\targetFolderFile.txt',
+                r'targetFolder\targetFolderFile.txt'],
+                [None,MATCH_TYPE_GLOB,True,True,True,True,True])
             ]
         for t in tests:
             print(t)
@@ -183,8 +263,11 @@ class Test(unittest.TestCase):
             assert len(actual)==len(t[0])
             for item in t[0]:
                 assert os.path.abspath(item) in actual
-                
-    def createShortcut(self):
+
+    def createShortcut(self)->None:
+        """
+        Test creating shortcuts without overwriting existing ones
+        """
         print()
         f='targetFile.txt'
         shutil.copy2(__HERE__+f,results_dir+f)
@@ -200,7 +283,10 @@ class Test(unittest.TestCase):
         assert results_dir+f+' 1.lnk'==lnk2.path
         assert lnk2.targetPath==results_dir+f
 
-    def iconLoader(self):
+    def iconLoader(self)->None:
+        """
+        Test loading icons from files and file types
+        """
         print()
         actual=iconImage(__HERE__+'defaulticon.ico')
         print('SHELL32.dll:0')
@@ -226,9 +312,11 @@ class Test(unittest.TestCase):
         except FileNotFoundError:
             pass
 
-def suite(tests=None):
+def suite(tests:Optional[Sequence[str]]=None)->unittest.TestSuite:
     """
     Combine unit tests into an entire suite
+
+    :param tests: names of tests to include (currently unused)
     """
     testSuite = unittest.TestSuite()
     #testSuite.addTest(Test("osEnquote"))
@@ -244,19 +332,30 @@ def suite(tests=None):
     return testSuite
 
 
-def run(tests=None,output=None,verbosity=2,failfast=False):
+def run(
+    tests:Optional[Sequence[str]]=None,
+    output:Optional[str]=None,
+    verbosity:int=2,
+    failfast:bool=False
+    )->None:
     """
     run the test suite
+
+    :param tests: names of tests to run
+    :param output: file to write results to (default stdout)
+    :param verbosity: unittest verbosity level
+    :param failfast: stop at the first failure
     """
     if output is None:
         output=sys.stdout
     else:
         output=open(output,'wb')
-    runner=unittest.TextTestRunner(output,verbosity=verbosity,failfast=failfast)
+    runner=unittest.TextTestRunner(
+        output,verbosity=verbosity,failfast=failfast)
     runner.run(suite(tests))
 
 
-def cmdline(args):
+def cmdline(args:typing.Iterable[str])->int:
     """
     Run the command line
 
@@ -264,9 +363,9 @@ def cmdline(args):
     """
     printhelp=False
     save=None
-    tests=[]
+    tests:typing.List[str]=[]
     if not args:
-        pass#printhelp=True
+        pass #printhelp=True
     else:
         for arg in args:
             if arg.startswith('-'):
@@ -283,9 +382,10 @@ def cmdline(args):
         print('Usage:')
         print('  test.py [options] [tests]')
         print('Options:')
-        print('   --save=filename ............... save the test output to this file, rather than the console')
-    else:
-        run(tests,save)
+        print('   --save=filename ............... save the test output to this file, rather than the console') # noqa: E501
+        return -1
+    run(tests,save)
+    return 0
 
 
 if __name__=='__main__':
