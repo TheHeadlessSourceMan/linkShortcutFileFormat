@@ -7,8 +7,9 @@ It allows advanced things like following links, regular expression
 and glob searching, etc.
 """
 import typing
-import os
 import re
+from paths import (UrlCompatible,UrlListCompatible,FilePath,asFilePath,
+    isUrlCompatible)
 from .windowsLinks import WindowsLink
 from .linkTypes import LINKTYPE_ANY,LinkTypeOf
 
@@ -46,7 +47,7 @@ def glob2re(glob:str,ignoreCase:bool=True)->typing.Pattern[str]:
 
 
 def findAll(
-    startPaths:typing.Union[str,typing.Iterable[str]],
+    startPaths:UrlListCompatible,
     match:typing.Union[None,str,typing.Pattern[str]]=None,
     matchType:int=MATCH_TYPE_GLOB,
     ignoreCase:bool=True,
@@ -54,7 +55,7 @@ def findAll(
     files:bool=True,
     links:typing.Union[bool,int]=False,
     recursive:bool=True,
-    ignore:typing.Union[None,typing.Sequence[str],typing.Set[str]]=None,
+    ignore:UrlListCompatible=None,
     useGlob:bool=False
     )->typing.Iterable[WindowsLink]:
     """
@@ -85,18 +86,23 @@ def findAll(
     :param ignore: specific files/directories to ignore
     :param useGlob: treat startPaths as glob expressions
     """
-    if not isinstance(startPaths,(list,set,tuple)):
-        startPaths=(startPaths)
+    if startPaths is None:
+        startPaths=[]
+    elif isUrlCompatible(startPaths):
+        startPaths=[startPaths] # type: ignore
+    startPaths=typing.cast(typing.List[UrlCompatible],startPaths)
     links=LinkTypeOf(links)
-    # make sure we have an ignore list as a set
+    # make sure we have an ignore set (of absolute path strings)
     if ignore is None:
-        ignore=set()
-    elif not isinstance(ignore,set):
-        ignore=set(ignore)
+        ignore=[]
+    elif isUrlCompatible(ignore):
+        ignore=[ignore] # type: ignore
+    ignored:typing.Set[str]={
+        str(asFilePath(i).absolute()) for i in ignore} # type: ignore
     # get the match as a regular expression
     if not match:
         match=None
-    if match is not None:
+    if match is not None and not isinstance(match,re.Pattern):
         flags=re.DOTALL
         if ignoreCase:
             flags=flags|re.IGNORECASE
@@ -111,38 +117,41 @@ def findAll(
                 match=re.compile(match,flags)
         else:
             raise Exception('Unknown match type: '+str(matchType))
+    match=typing.cast(typing.Optional[re.Pattern[str]],match)
     # create list of the things to be searched
     dumbStuffIGottaSearch:typing.List[WindowsLink]=[]
     if useGlob:
         import glob
         for globExpression in startPaths:
-            for path in glob.glob(globExpression):
-                if path not in ignore:
-                    ignore.add(path)
-                    dumbStuffIGottaSearch.append(WindowsLink(path))
+            for found in glob.glob(str(asFilePath(globExpression))):
+                key=str(asFilePath(found).absolute())
+                if key not in ignored:
+                    ignored.add(key)
+                    dumbStuffIGottaSearch.append(WindowsLink(found))
     else:
-        for path in startPaths:
-            path=os.path.abspath(path)
-            if path not in ignore:
-                ignore.add(path)
-                dumbStuffIGottaSearch.append(WindowsLink(path))
+        for startPath in startPaths:
+            startFile=asFilePath(startPath).absolute()
+            if str(startFile) not in ignored:
+                ignored.add(str(startFile))
+                dumbStuffIGottaSearch.append(WindowsLink(startFile))
     # start searching
     while dumbStuffIGottaSearch:
         currentDir=dumbStuffIGottaSearch.pop(0)
         try:
-            children=os.listdir(currentDir.targetPath)
+            children=list(currentDir.targetPath.iterdir())
         except Exception: # as e:
             print('ERR: getting directory listing of:\n  ',currentDir.targetPath,file=sys.stderr) # noqa: E501
             #raise e
             continue
-        for filename in children:
-            path=currentDir.targetPath+os.sep+filename
-            if path in ignore:
+        for child in children:
+            filename=child.name
+            key=str(child)
+            if key in ignored:
                 continue
-            item=WindowsLink(path)
+            item=WindowsLink(child)
             try:
                 if item.isDirectory: # checking this is faster, but could return duplicate files! # noqa: E501
-                    ignore.add(path)
+                    ignored.add(key)
             except Exception: # skip and keep going if things barf
                 continue
             # yield the file if it matches the search criteria
@@ -161,13 +170,49 @@ def findAll(
                 dumbStuffIGottaSearch.append(item)
 
 
+def showAllShortcuts(path:UrlCompatible,recursive:bool=True)->None:
+    """
+    Find and display all links
+
+    same as showAllLinks()
+
+    :param path: where to start searching
+    :param recursive: True/False whether to search sub-directories
+    """
+    return showAllLinks(path,recursive)
+def showAllLinks(path:UrlCompatible,recursive:bool=True)->None:
+    """
+    Find and display all links
+
+    :param path: where to start searching
+    :param recursive: True/False whether to search sub-directories
+    """
+    for link in findAll(path,files=False,links=True,recursive=recursive):
+        print(f'{link.path} => {link.targetPath}')
+
+
+def _isUnder(path:FilePath,prefix:FilePath)->bool:
+    """
+    Is path the same as, or inside of, prefix?
+    (the drive letter is not case sensitive)
+
+    :param path: the path to check
+    :param prefix: the containing path
+    """
+    pathParts=path.parts
+    prefixParts=prefix.parts
+    if len(prefixParts)>len(pathParts) \
+        or pathParts[0].lower()!=prefixParts[0].lower():
+        return False
+    return pathParts[1:len(prefixParts)]==prefixParts[1:]
+
+
 def refactorShortcuts(
-    path:str,
+    path:UrlCompatible,
     reFrom:typing.Union[str,typing.Pattern[str]],
     reTo:str,
     recursive:bool=False,
-    constrainTo:typing.Union[
-        str,None,typing.Pattern[str],typing.List[str]]=None,
+    constrainTo:typing.Optional[UrlCompatible]=None,
     dryRun:bool=False
     )->None:
     """
@@ -194,28 +239,24 @@ def refactorShortcuts(
         links=True,
         recursive=recursive)
     if constrainTo is None or constrainTo=='': # must at least be in the same drive letter # noqa: E501
-        constrainTo=path.split('\\',1)[0].upper()
+        constrainPath=FilePath(asFilePath(path).absolute().parts[0])
     else:
-        constrainToParts=constrainTo.split('\\',1)
-        constrainToParts[0]=constrainToParts[0].upper()
-        constrainTo='\\'.join(constrainToParts)
-    if type(reFrom)==str:
+        constrainPath=asFilePath(constrainTo).absolute()
+    if isinstance(reFrom,str):
         reFrom=re.compile(reFrom)
-    for sc in linkFinderGenerator:
-        sc=winshell.shortcut(sc)
-        fromPath=str(sc.lnk_filepath)
-        toPath=str(sc.path)
-        if toPath.find(constrainTo)==0: # Make sure this is a path we are allowed to make relative (also verifies that it doesn't start with %CD%) # noqa: E501
-            newPath,count=reFrom.subn(reTo,toPath)
-            if count>0 and toPath!=fromPath:
-                print('changing...',fromPath+' => '+toPath)
+    for link in linkFinderGenerator:
+        fromPath=link.path
+        toPath=link.targetPath
+        if _isUnder(toPath,constrainPath):
+            newPath,count=reFrom.subn(reTo,str(toPath))
+            if count>0 and newPath!=str(toPath):
+                print('changing...',fromPath,'=>',toPath)
                 print('Changing to:',newPath)
                 if not dryRun:
-                    sc.path=newPath
-                    sc.write()
+                    link.targetPath=newPath
         else:
-            print('skipping:',fromPath+' => '+toPath)
-            print('\t(it must start with "'+constrainTo+'")')
+            print('skipping:',fromPath,'=>',toPath)
+            print('\t(it must start with "'+str(constrainPath)+'")')
 
 
 def cmdline(args:typing.Iterable[str])->int:

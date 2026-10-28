@@ -7,17 +7,30 @@ Tools to fix links including:
     * ... more?
 """
 import typing
-import os
-import winshell # type: ignore
+from paths import UrlCompatible,UrlListCompatible,FilePath,asFilePath
 from .findReplace import findAll
 from .linkTypes import (
     LINKTYPE_ANY,LINKTYPE_SHORTCUT,LINKTYPE_FOLDER_SHORTCUT,LINKTYPE_NONLINK)
 
 
+def _build(base:typing.Optional[FilePath],
+    parts:typing.Iterable[str]
+    )->typing.Optional[FilePath]:
+    """
+    Append path parts to a base path
+
+    :param base: where to start (None to start with the first part)
+    :param parts: the parts to add
+    """
+    for part in parts:
+        base=FilePath(part) if base is None else base/part
+    return base
+
+
 def findBrokenShortcuts(
-    path:str,
+    path:UrlCompatible,
     recursive:bool=True
-    )->typing.Iterable[typing.Tuple[str,str]]:
+    )->typing.Iterable[typing.Tuple[FilePath,FilePath]]:
     """
     This is a generator, so you probably want to do like:
         for link,path in findBrokenShortcuts(...):
@@ -28,15 +41,13 @@ def findBrokenShortcuts(
     linkFinderGenerator=findAll(
         path,files=False,links=True,recursive=recursive)
     for sc in linkFinderGenerator:
-        sc=winshell.shortcut(sc) # type: ignore
-        if (not os.path.isdir(sc.path)) and (not os.path.isfile(sc.path)): # type: ignore # noqa: E501
-            yield sc.lnk_filepath,sc.path # type: ignore
+        if not sc.targetPath.exists():
+            yield sc.path,sc.targetPath
 
 
 def _detectRenamedBranch(
-    path:str,
-    sep:typing.Optional[str]=None
-    )->typing.Optional[str]:
+    path:UrlCompatible
+    )->typing.Optional[FilePath]:
     """
     For each level in path, detect if there is a one-off name difference
         /foo/bar/myfile => /foo/baz/myfile
@@ -46,117 +57,94 @@ def _detectRenamedBranch(
     Either returns a corrected path, or None if it couldn't find a fix
 
     :param path: the broken path
-    :param sep: path separator (default os.sep)
     """
-    if sep is None:
-        sep=os.sep
-    print('for "'+path+'"')
-    pathParts=path.split(sep)
+    print('for "'+str(path)+'"')
+    pathParts=asFilePath(path).parts
     for i in range(0,len(pathParts)-1):
         path_idx=len(pathParts)-i-2
         if path_idx<=0:
             break
-        pre=sep.join(pathParts[0:path_idx])
-        post=sep.join(pathParts[path_idx+1:])
-        print('\t'+pre+sep+'???'+sep+post)
-        try:
-            for d in os.listdir(pre):
-                if not os.path.isdir(d):
-                    continue
-                test=pre+sep+d+sep+post
-                print('\t\ttesting "'+test+'"')
-                if os.path.isfile(test) or os.path.isdir(test):
-                    return test
-        except Exception as e:
-            print('\t\t'+(str(e).strip()))
-        post=sep.join(pathParts[path_idx:])
-        print('\t'+pre+sep+'???'+sep+post)
-        try:
-            for d in os.listdir(pre):
-                if not os.path.isdir(d):
-                    continue
-                test=pre+sep+d+sep+post
-                print('\t\ttesting "'+test+'"')
-                if os.path.isfile(test) or os.path.isdir(test):
-                    return test
-        except Exception as e:
-            print('\t\t'+(str(e).strip()))
+        pre=_build(None,pathParts[0:path_idx])
+        assert pre is not None
+        for post in (pathParts[path_idx+1:],pathParts[path_idx:]):
+            print('\t'+str(pre)+' ??? '+'/'.join(post))
+            try:
+                for d in pre.iterdir():
+                    if not d.isDirectory:
+                        continue
+                    test=_build(d,post)
+                    print('\t\ttesting "'+str(test)+'"')
+                    assert test is not None
+                    if test.exists():
+                        return test
+            except Exception as e:
+                print('\t\t'+(str(e).strip()))
     return None
 
 
 def _findMissingLevel(
-    path:str,
-    sep:typing.Optional[str]=None
-    )->typing.Optional[str]:
+    path:UrlCompatible
+    )->typing.Optional[FilePath]:
     """
     Find at which point a path goes missing
 
     :param path: the path to check
-    :param sep: path separator (default os.sep)
     """
-    if sep is None:
-        sep=os.sep
-    pathParts=path.split(sep)
-    for i in range(len(pathParts)): # TODO: reverse search may be more efficient # noqa: E501
-        p=sep.join(pathParts[0:i+1])
-        if not (os.path.isdir(p) or os.path.isfile(p)):
+    p:typing.Optional[FilePath]=None
+    for part in asFilePath(path).parts: # TODO: reverse search may be more efficient # noqa: E501
+        p=_build(p,[part])
+        assert p is not None
+        if not p.exists():
             return p
     return None
 
 
-_findItemsDirCache:typing.Dict[str,typing.List[str]]={}
+_findItemsDirCache:typing.Dict[str,typing.List[FilePath]]={}
 def _findItems(
-    start:str,
-    itemName:str,
-    sep:typing.Optional[str]=None
-    )->typing.Iterator[str]:
+    start:UrlCompatible,
+    itemName:str
+    )->typing.Iterator[FilePath]:
     """
     Generator returns all occourances
 
     :param start: directory to start searching from
     :param itemName: file/directory name to look for
-    :param sep: path separator (default os.sep)
     """
-    if sep is None:
-        sep=os.sep
-    search=[start]
+    search=[asFilePath(start)]
     while search:
         s=search.pop(0)
+        key=str(s)
         try:
-            if s not in _findItemsDirCache:
-                _findItemsDirCache[s]=[s+sep+i for i in os.listdir(s)]
+            if key not in _findItemsDirCache:
+                _findItemsDirCache[key]=list(s.iterdir())
         except Exception:
-            _findItemsDirCache[s]=[]
-        for f in _findItemsDirCache[s]:
-            if f.rsplit(sep,1)[-1]==itemName:
+            _findItemsDirCache[key]=[]
+        for f in _findItemsDirCache[key]:
+            if f.name==itemName:
                 yield f
-            if os.path.isdir(f):
+            if f.isDirectory:
                 search.append(f)
 
 
 def _findBestItem(
-    start:str,
-    itemPath:str,
-    sep:typing.Optional[str]=None
-    )->typing.Optional[str]:
+    start:UrlCompatible,
+    itemPath:UrlCompatible
+    )->typing.Optional[FilePath]:
     """
     returns the item that best maches the itemPath
 
     :param start: directory to start searching from
     :param itemPath: the path to find a best match for
-    :param sep: path separator (default os.sep)
     """
-    if sep is None:
-        sep=os.sep
-    pathParts=itemPath.split(sep)
+    pathParts=asFilePath(itemPath).parts
     bestScore=0
     bestMatch=None
     print('\tSearching for',pathParts[-1],'in',start)
-    for found in _findItems(start,pathParts[-1],sep):
-        foundPath=found.split(sep)
+    for found in _findItems(start,pathParts[-1]):
+        foundParts=found.parts
         score=0
         for d in pathParts:
-            if d in foundPath:
+            if d in foundParts:
                 score=score+1
         print(score,found)
         if score>bestScore:
@@ -166,7 +154,7 @@ def _findBestItem(
 
 
 def fixBrokenShortcuts(
-    path:str,
+    path:UrlCompatible,
     recursive:bool=True,
     dryRun:bool=False
     )->None:
@@ -181,15 +169,16 @@ def fixBrokenShortcuts(
     fixed=0
     for _,target in findBrokenShortcuts(path,recursive):
         found=found+1
-        if target.find('\\art\\')>=0 or target.find('Program Files')>=0: # for now # noqa: E501
+        targetStr=str(target)
+        if targetStr.find('\\art\\')>=0 or targetStr.find('Program Files')>=0: # for now # noqa: E501
             continue
-        print('Fixing: "'+target+'"')
+        print('Fixing: "'+targetStr+'"')
         missing=_findMissingLevel(target)
         print(f'\tLost at: "{missing}"')
         if missing is None:
             z=None
         else:
-            z=_findBestItem(missing.rsplit('\\',1)[0],target)
+            z=_findBestItem(missing.parent,target)
         if z is not None:
             print(f'\tFound: "{z}"')
             fixed=fixed+1
@@ -198,15 +187,15 @@ def fixBrokenShortcuts(
             z=_detectRenamedBranch(target)
             if z is not None:
                 print('DETECTED:')
-                print('\t'+target)
+                print('\t'+targetStr)
                 print('\t\twas renamed to')
-                print('\t'+z)
+                print('\t'+str(z))
                 fixed=fixed+1
                 break
     print('\n(',fixed,'/',found,') broken links fixed')
 
 
-def printBrokenShortcuts(path:str,recursive:bool=True)->None:
+def printBrokenShortcuts(path:UrlCompatible,recursive:bool=True)->None:
     """
     print(a list of broken shortcuts)
 
@@ -216,17 +205,17 @@ def printBrokenShortcuts(path:str,recursive:bool=True)->None:
     i=0
     for k,v in findBrokenShortcuts(path,recursive):
         i=i+1
-        print(k+' => '+v)
+        print(f'{k} => {v}')
     print('\n',i,'broken links found')
 
 
 def cleanupShortcuts(
-    searchPaths:typing.Union[str,typing.Iterable[str]],
+    searchPaths:UrlListCompatible,
     recursive:bool=False,
     sanitize:bool=False,
     toFolderShortcuts:bool=False,
     undoFolderShortcuts:bool=False,
-    ignorePaths:typing.Optional[typing.Iterable[str]]=None,
+    ignorePaths:UrlListCompatible=None,
     dry:bool=False,
     useGlob:bool=False
     )->None:
@@ -258,9 +247,9 @@ def cleanupShortcuts(
             elif sanitize:
                 lnk.sanitize()
         elif lnk.linkType==LINKTYPE_NONLINK and recursive and lnk.isDirectory:
-            for f in os.listdir(lnk.targetPath):
+            for f in lnk.targetPath.iterdir():
                 cleanupShortcuts(
-                    os.path.join(lnk.targetPath,f),
+                    f,
                     recursive,sanitize,toFolderShortcuts=toFolderShortcuts,
                     undoFolderShortcuts=undoFolderShortcuts,
                     dry=dry,ignorePaths=ignorePaths)

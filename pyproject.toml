@@ -1,19 +1,22 @@
 [project]
-name="authorsDashboardProjectPlugin"
+name="linkShortcutFileFormat"
 version="1.0.0.0"
-description = "Extract project info from author dashboards"
+description = "File format for windows .lnk shortcuts"
 readme="README.md"
-requires-python = ">= 3.8"
+requires-python = ">= 3.9"
+dependencies = [
+    "paths @ git+https://github.com/TheHeadlessSourceMan/paths.git",
+]
 authors = [{name = "KC Eilander"}]
 license = "MIT"
 license-files = ["LICENSE"]
 keywords=[]
 
 [tool.setuptools.package-dir]
-authorsDashboardProjectPlugin = "."
+linkShortcutFileFormat = "."
 
 [project.urls]
-Homepage = "https://github.com/TheHeadlessSourceMan/projectMud"
+Homepage = "https://github.com/TheHeadlessSourceMan/linkShortcutFileFormat"
 
-[project.entry-points."projectMud.plugin"]
-authorsDashboardProjectPlugin='authorsDashboardProjectPlugin:AuthorsDashboardProjectPlugin'
+[project.entry-points."pyFormatGenie.plugin"]
+linkShortcutFileFormat='filetypePlugin:FiletypePlugin'

@@ -7,21 +7,76 @@ If a proper file is given, will be able to handle it gracefully in most
 cases, but beware of what you have before operating on it.
 (use WindowsLink.isLink())
 
+Shortcuts are read and written directly in the binary .lnk format, and
+symbolic/hard links go through the standard library, so no windows
+libraries are required.
+
 Also handles special case "Folder Shortcuts" (not the same as a shortcut
 to a folder)  For the scoop on that, see:
     https://superuser.com/questions/456399/what-different-types-of-shortcut-are-there/639967#639967
 """
 import typing
 import os
-import sys
 import subprocess
-import pythoncom
-from win32com.shell import shell, shellcon
-from win32com.storagecon import STGM_READ
-from .linkExceptions import LinkException
-from .windowsUtils import osEnquote,nextAvailableFilename,pathToUnc
+from paths import UrlCompatible,FilePath,asFilePath
+from .linkExceptions import LinkException,RecursiveLinkException
+from .windowsUtils import osEnquote,nextAvailableFilename,fileAttributes
+from .windowsLnkFormat import WindowsLnkFormat
 from .linkTypes import (LINK_TYPES,
-    LINKTYPE_SHORTCUT,LINKTYPE_NONLINK,LINKTYPE_FOLDER_SHORTCUT)
+    LINKTYPE_SHORTCUT,LINKTYPE_NONLINK,LINKTYPE_FOLDER_SHORTCUT,
+    LINKTYPE_JUNCTION,LINKTYPE_HARD_LINK,LINKTYPE_SYMBOLIC_LINK)
+
+
+_FOLDER_SHORTCUT_CLSID='{0AFACED1-E828-11D1-9187-B532F1E9575D}'
+_FOLDER_SHORTCUT_TARGET='target.lnk'
+_FOLDER_SHORTCUT_INI='desktop.ini'
+
+
+def _lexists(path:FilePath)->bool:
+    """
+    Does this exist (including broken symlinks)?
+
+    :param path: the path to check
+    """
+    return bool(path.exists()) or path.pathlibPath.is_symlink()
+
+
+def _folderShortcutTarget(path:FilePath)->typing.Optional[FilePath]:
+    """
+    If path is a "folder shortcut", return the file holding its
+    target (otherwise None)
+
+    :param path: the directory to inspect
+    """
+    lnk=path/_FOLDER_SHORTCUT_TARGET
+    ini=path/_FOLDER_SHORTCUT_INI
+    if not (lnk.is_file() and ini.is_file()):
+        return None
+    data=ini.pathlibPath.read_bytes()
+    for encoding in ('utf-16','utf-8','cp1252'):
+        try:
+            text=data.decode(encoding)
+            break
+        except UnicodeError:
+            continue
+    else:
+        return None
+    if _FOLDER_SHORTCUT_CLSID.lower() in text.lower():
+        return lnk
+    return None
+
+
+def _winAttrib(path:FilePath,flags:typing.Sequence[str])->None:
+    """
+    Set attributes (eg. '+s') using the windows attrib command.
+    Does nothing on other operating systems.
+
+    :param path: file or directory
+    :param flags: attrib flags
+    """
+    if os.name=='nt':
+        subprocess.run(['attrib',*flags,str(path)],check=False,
+            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 
 
 class WindowsLink:
@@ -35,50 +90,83 @@ class WindowsLink:
     Also handles special case "Folder Shortcuts" (not the same as a shortcut
     to a folder)  For the scoop on that, see:
         https://superuser.com/questions/456399/what-different-types-of-shortcut-are-there/639967#639967
+
+    NOTE: FilePath's == operator recurses forever, so compare paths
+    using str() instead.
     """
 
-    def __init__(self,path:str,resolveBroken:bool=False):
+    def __init__(self,path:UrlCompatible,resolveBroken:bool=False):
         """
         :param path: path to the link we want to inspect
         :param resolveBroken: try to find the target if it has moved
             (can be slow)
-
-        NOTE:
-            https://docs.microsoft.com/en-us/windows/desktop/shell/sfgao
-            https://docs.microsoft.com/en-us/windows/desktop/api/Shobjidl_core/nn-shobjidl_core-ishelllinka
         """
-        self._path:str=os.path.abspath(path)
+        self._path:FilePath=asFilePath(path).absolute()
         self._resolveBroken:bool=resolveBroken
-        self._targetPath:typing.Optional[str]=None
-        self._uncPath:typing.Optional[str]=None
-        self._workingDirectory:typing.Optional[str]=None
+        self._targetPath:typing.Optional[FilePath]=None # non-shortcut links
+        self._lnk:typing.Optional[WindowsLnkFormat]=None
+        self._lnkFile:typing.Optional[FilePath]=None
         self._linkType:int=LINKTYPE_NONLINK
-        self._description:typing.Optional[str]=None
-        self._iconPath:typing.Optional[str]=None
-        self._iconIndex:int=0
         self._isDirectory:bool=False
-        self._isZipFile:bool=False
         self._loaded:bool=False
 
+    def _editShortcut(self,
+        edit:typing.Callable[[WindowsLnkFormat],None]
+        )->None:
+        """
+        Change the underlying .lnk data and save it
+
+        :param edit: function that modifies the loaded lnk data
+        """
+        self.refreshInfo(False)
+        if self._lnk is None or self._lnkFile is None:
+            raise LinkException('ERR: only shortcuts can be edited: '+str(self.path)) # noqa: E501
+        edit(self._lnk)
+        self._lnk.save(self._lnkFile,noClobberFile=False)
+        self.refreshInfo(True)
+
+    @staticmethod
+    def _targetInfo(target:UrlCompatible)->typing.Tuple[bool,int]:
+        """
+        (is a directory, file size) of a link target on disk
+
+        :param target: the target path
+        """
+        p=asFilePath(target)
+        size=p.pathlibPath.stat().st_size if p.is_file() else 0
+        return p.isDirectory,size
+
+    def _setTarget(self,target:UrlCompatible)->None:
+        """
+        Point the shortcut at a new target
+
+        :param target: the new target path
+        """
+        info=WindowsLink._targetInfo(target)
+        self._editShortcut(lambda k:k.setTarget(target,*info))
+
     @property
-    def targetPath(self)->str:
+    def targetPath(self)->FilePath:
         """
         target path location for the link
 
         If it is not a link, returns the path
         """
         self.refreshInfo(False)
-        if self._targetPath is None:
+        target=self._targetPath
+        if self._lnk is not None:
+            target=self._lnk.getTarget()
+        if target is None:
             return self.path
-        return os.path.abspath(self._targetPath)
+        return target.absolute()
     @targetPath.setter
-    def targetPath(self,targetPath:str)->None:
+    def targetPath(self,targetPath:UrlCompatible)->None:
         """
-        target path location for the link
+        target path location for the link (shortcuts only)
 
-        :param targetPath: the new target (not yet supported)
+        :param targetPath: the new target
         """
-        raise NotImplementedError()
+        self._setTarget(targetPath)
 
     @property
     def uncPath(self)->typing.Optional[str]:
@@ -86,31 +174,36 @@ class WindowsLink:
         UNC path location for the link
         """
         self.refreshInfo(False)
-        return self._uncPath
+        if self._lnk is None:
+            return None
+        return self._lnk.uncPath
     @uncPath.setter
     def uncPath(self,uncPath:str)->None:
         """
-        UNC path location for the link
+        UNC path location for the link (shortcuts only)
 
-        :param uncPath: the new UNC path (not yet supported)
+        :param uncPath: the new UNC path
         """
-        raise NotImplementedError()
+        self._setTarget(uncPath)
 
     @property
-    def workingDirectory(self)->typing.Optional[str]:
+    def workingDirectory(self)->typing.Optional[FilePath]:
         """
         working directory for the link
         """
         self.refreshInfo(False)
-        return self._workingDirectory
+        if self._lnk is None or not self._lnk.workingDirectory:
+            return None
+        return FilePath(self._lnk.workingDirectory)
     @workingDirectory.setter
-    def workingDirectory(self,workingDirectory:str)->None:
+    def workingDirectory(self,workingDirectory:UrlCompatible)->None:
         """
-        working directory for the link
+        working directory for the link (shortcuts only)
 
-        :param workingDirectory: the new working directory (not yet supported)
+        :param workingDirectory: the new working directory
         """
-        raise NotImplementedError()
+        text=str(asFilePath(workingDirectory))
+        self._editShortcut(lambda s:setattr(s,'workingDirectory',text))
 
     @property
     def description(self)->typing.Optional[str]:
@@ -118,31 +211,35 @@ class WindowsLink:
         link description
         """
         self.refreshInfo(False)
-        return self._description
+        if self._lnk is None:
+            return None
+        return self._lnk.description
     @description.setter
     def description(self,description:str)->None:
         """
-        link description
+        link description (shortcuts only)
 
-        :param description: the new description (not yet supported)
+        :param description: the new description
         """
-        raise NotImplementedError()
+        self._editShortcut(lambda s:setattr(s,'description',description))
 
     @property
     def iconPath(self)->typing.Optional[str]:
         """
-        path to the icon file
+        path to the icon file (as stored, so it may contain %variables%)
         """
         self.refreshInfo(False)
-        return self._iconPath
+        if self._lnk is None:
+            return None
+        return self._lnk.iconFile
     @iconPath.setter
     def iconPath(self,iconPath:str)->None:
         """
-        path to the icon file
+        path to the icon file (shortcuts only)
 
-        :param iconPath: the new icon path (not yet supported)
+        :param iconPath: the new icon path
         """
-        raise NotImplementedError()
+        self._editShortcut(lambda s:setattr(s,'iconFile',iconPath))
 
     @property
     def iconIndex(self)->int:
@@ -150,26 +247,49 @@ class WindowsLink:
         index of the icon within the file
         """
         self.refreshInfo(False)
-        return self._iconIndex
+        if self._lnk is None:
+            return 0
+        return self._lnk.iconNumber
     @iconIndex.setter
     def iconIndex(self,iconIndex:int)->None:
         """
-        index of the icon within the file
+        index of the icon within the file (shortcuts only)
 
-        :param iconIndex: the new icon index (not yet supported)
+        :param iconIndex: the new icon index
         """
-        raise NotImplementedError()
+        self._editShortcut(lambda s:setattr(s,'iconNumber',iconIndex))
+
+    @property
+    def hotKey(self)->int:
+        """
+        raw hotkey value (low byte=virtual key, high byte=modifiers)
+        """
+        self.refreshInfo(False)
+        if self._lnk is None:
+            return 0
+        return self._lnk.hotKey
+    @hotKey.setter
+    def hotKey(self,hotKey:int)->None:
+        """
+        raw hotkey value (shortcuts only)
+
+        :param hotKey: the new hotkey
+        """
+        self._editShortcut(lambda s:setattr(s,'hotKey',hotKey))
 
     @property
     def icon(self)->typing.Optional[typing.Any]:
         """
         get the icon as a PIL image
 
-        can return None
+        can return None if the link has no custom icon.
+        If the icon cannot be extracted on this operating system,
+        a default image is returned.
         """
-        if self.iconPath is not None:
-            from PIL import Image
-            return Image.open(self.iconPath)
+        if self.iconPath:
+            from .windowsUtils import iconImage
+            return iconImage(
+                self.iconPath+':'+str(self.iconIndex),index_plus_one=False)
         return None
 
     @property
@@ -178,8 +298,6 @@ class WindowsLink:
         Is the link target a directory (or a file)?
         """
         self.refreshInfo(False)
-        if self._isZipFile: # otherwise windows will say, "yes this is a directory" # noqa: E501
-            return False
         return self._isDirectory
 
     @property
@@ -190,7 +308,7 @@ class WindowsLink:
         return self.linkType!=LINKTYPE_NONLINK
 
     @property
-    def path(self)->str:
+    def path(self)->FilePath:
         """
         the path to the link this object points to
 
@@ -199,13 +317,13 @@ class WindowsLink:
         """
         return self._path
     @path.setter
-    def path(self,path:str)->None:
+    def path(self,path:UrlCompatible)->None:
         """
         Point this object at a different link
 
         :param path: path to the new link
         """
-        self._path=os.path.abspath(path)
+        self._path=asFilePath(path).absolute()
         self.refreshInfo(True)
 
     @property
@@ -224,7 +342,7 @@ class WindowsLink:
         self._resolveBroken=resolveBroken
         self.refreshInfo(True)
 
-    def rename(self,newName:str,dry:bool=False)->None:
+    def rename(self,newName:UrlCompatible,dry:bool=False)->None:
         """
         Rename this file/link
 
@@ -232,12 +350,12 @@ class WindowsLink:
         :param dry: perform a dry run without actually renaming anything
         """
         if self.linkType==LINKTYPE_NONLINK:
-            newName=os.path.abspath(newName)
-            print('changing',LINK_TYPES[self.linkType],'shortcut',osEnquote(self.path)) # noqa: E501
-            print('    into',LINK_TYPES[self.linkType],'shortcut',osEnquote(newName)) # noqa: E501
+            newPath=asFilePath(newName).absolute()
+            print('changing',LINK_TYPES[self.linkType],'shortcut',osEnquote(str(self.path))) # noqa: E501
+            print('    into',LINK_TYPES[self.linkType],'shortcut',osEnquote(str(newPath))) # noqa: E501
             if not dry:
-                os.rename(self.path,newName)
-                self.path=newName # will force a refresh
+                self.path.pathlibPath.rename(newPath.pathlibPath)
+                self.path=newPath # will force a refresh
         else:
             self._changeShortcut(None,newName,False,dry=dry)
 
@@ -281,7 +399,7 @@ class WindowsLink:
 
     def _changeShortcut(self,
         newType:typing.Optional[int]=None,
-        newPath:Optional[str]=None,
+        newPath:typing.Optional[UrlCompatible]=None,
         sanitize:bool=True,
         dry:bool=False
         )->None:
@@ -296,8 +414,7 @@ class WindowsLink:
         :param sanitize: remove any "Shortcut To X" and "X - Shortcut" nonsense
         :param dry: perform a dry run without changing anything
         """
-        if newPath is None:
-            newPath=self.path
+        newName=str(self.path if newPath is None else asFilePath(newPath))
         if self.linkType==LINKTYPE_NONLINK:
             raise LinkException('ERR: Cannot change a file into a link (would result in lost file AND targetless link)') # noqa: E501
         if newType is None:
@@ -308,156 +425,24 @@ class WindowsLink:
             if not self.isDirectory:
                 raise LinkException('ERR: Cannot create directory shortcut to something that is not a directory!') # noqa: E501
         # figure out the new filename
-        newPath=self.path
         if newType!=LINKTYPE_SHORTCUT: # strip any .lnk extension(s)
-            while newPath.endswith('.lnk'):
-                newPath=newPath[0:-4]
-        elif newType==LINKTYPE_SHORTCUT: # make sure it has a .lnk extension
-            if not newPath.endswith('.lnk'):
-                newPath=newPath+'.lnk'
-        newPath=nextAvailableFilename(newPath,ignore=self.path)
+            while newName.endswith('.lnk'):
+                newName=newName[0:-4]
+        elif not newName.endswith('.lnk'): # make sure it has a .lnk extension
+            newName=newName+'.lnk'
+        newPath=nextAvailableFilename(newName,ignore=self.path)
         if sanitize:
             newPath=self._sanitizedName(newPath)
         # make sure something has changed, or why take action?
-        if newPath!=self.path or newType!=self.linkType:
+        if str(newPath)!=str(self.path) or newType!=self.linkType:
+            target=self.targetPath
             # delete existing, then create new
             self.deleteLink(dry=dry)
-            newLink=WindowsLink.createLink(
-                self.targetPath,newType,newPath,False,dry)
-            if not dry:
+            newLink=WindowsLink.createLink(target,newType,newPath,False,dry)
+            if not dry and newLink is not None:
                 self.path=newLink.path # will force a refresh, which is what we want! # noqa: E501
-                self._linkType=newType
 
-    def _getLinkTarget(self,path:str)->str:
-        """
-        Get the target of a link
-
-        :param path: path to the link
-        """
-        return self._getLinkTargetOld(path)
-
-    def _getLinkTargetSlow(self,path:str)->str:
-        """
-        cheesy workaround, but it at least works
-
-        scrape the output of a DIR command
-
-        :param path: path to the link
-        """
-        import re
-        import subprocess
-        target=path
-        path=path.rsplit(os.sep,1)
-        regex=r'(?P<month>[0-9]{2})/(?P<day>[0-9]{2})/(?P<year>[0-9]{4})\s+(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2})\s+(?P<ampm>AM|PM)\s{4}((?P<kind><(.*)>)|(\s*(?P<size>[0-9,]+)))\s+(?P<filename>.*)' # noqa: E501
-        regex=re.compile(regex,re.IGNORECASE|re.DOTALL)
-        #cmd='dir /n /r "'+path[0]+'"'
-        cmd='dir /al /n /r "'+path[0]+'"' # make a little faster by only asking for symlinks # noqa: E501
-        out,err=subprocess.Popen(cmd,shell=True,
-            stdout=subprocess.PIPE,stderr=subprocess.PIPE).communicate()
-        out=out.decode('utf-8','ignore').replace('\r','').split('\n')
-        for line in out:
-            if not line or line[0]==' ':
-                continue
-            match=regex.match(line)
-            if not match.group('kind'):
-                #print("Match failed on line\n  ",line)
-                continue
-            #print('Link kind:\n  ',match.group('kind'))
-            if match.group('kind') in ('<SYMLINKD>'):
-                filename=match.group('filename').rsplit('[',1)
-                link_target=filename[1].rsplit(']',1)[0].strip()
-                filename=filename[0].strip()
-                if filename==path[1]:
-                    self._linkType=LINKTYPE_FOLDER_SHORTCUT
-                    target=link_target
-                    return target # bail fast
-                    #break
-        if False: # try again using traditional method instead
-            path=os.sep.join(path)
-            if target==path:
-                # link type/target not specified by dir, but still could be one
-                target=self._getLinkTarget(path)
-        return target
-
-    def _getLinkTargetNew(self,path:str)->None:
-        """
-        another idea that allegedly works, but I haven't seen it
-
-        :param path: path to the link
-        """
-        import win32file
-        import win32con
-        hFile:=win32file.CreateFile(path,
-            win32file.GENERIC_READ,
-            win32file.FILE_SHARE_READ,
-            None,
-            win32con.OPEN_EXISTING,
-            0x400|0x10, #win32file.FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY # noqa: E501
-            #win32file.FILE_ATTRIBUTE_NORMAL,
-            None)
-        hFile=typing.cast(int,hFile)
-        win32file.GetFinalPathNameByHandle( # type: ignore
-            hFile,win32con.VOLUME_NAME_NT)
-        win32file.CloseHandle(hFile)
-
-    def _getLinkTargetOld(self,path:str)->typing.Optional[str]:
-        """
-        This did okay, but I couldn't make it work with directory links
-
-        :param path: path to the link
-        :return: target path if found, otherwise None
-        """
-        import ctypes
-        Msi=ctypes.WinDLL('msi.dll')
-        hResult=Msi.MsiGetShortcutTargetW(path,None,None,None)
-        if hResult==0:
-            # https://stackoverflow.com/questions/32413157/why-in-finding-target-path-of-shortcut-with-shell-link-in-c-it-refers-to-windo
-            MAX_PATH=256
-            pcchBuf=ctypes.wintypes.LPDWORD(MAX_PATH) # type: ignore
-            hResult=Msi.MsiGetComponentPathW(None,None,path,pcchBuf)
-            print(hResult)
-        else:
-            shellLink=pythoncom.CoCreateInstance(
-                shell.CLSID_ShellLink,
-                None,
-                pythoncom.CLSCTX_INPROC_SERVER,
-                shell.IID_IShellLink)
-            if self._isDirectory:
-                # print('IID_IPersistStream')
-                persistFile=shellLink.QueryInterface( # type: ignore
-                    pythoncom.IID_IPersistStream)
-            else:
-                # print('IID_IPersistFile')
-                persistFile=shellLink.QueryInterface( # type: ignore
-                    pythoncom.IID_IPersistFile)
-            self._linkType=LINKTYPE_SHORTCUT
-            if self._isDirectory:
-                self._linkType=LINKTYPE_FOLDER_SHORTCUT
-            if True:
-                try:
-                    if os.path.exists(path):
-                        persistFile.Load(path) # type: ignore
-                    else:# os.path.exists(path+'.lnk'):
-                        persistFile.Load(path+'.lnk') # type: ignore
-                except Exception: # as e:
-                    #print('WARN: Had trouble inspecting file\n  ',path)
-                    #raise e
-                    self._linkType=LINKTYPE_NONLINK
-                    return path
-            #if self.resolveBroken:
-            #    shellLink.Resolve(0,shell.SLR_ANY_MATCH|shell.SLR_NO_UI)
-            self._targetPath,_=shellLink.GetPath(0) # type: ignore
-            self._uncPath=shellLink.GetPath( # type: ignore
-                shell.SLGP_UNCPRIORITY)[0]
-        #print('PPP',self._targetPath)
-        #print('UUU',self._uncPath)
-        shellLink.GetDescription() # type: ignore
-        self._workingDirectory=shellLink.GetWorkingDirectory() # type: ignore
-        self._iconPath,self._iconIndex=shellLink.GetIconLocation() # type: ignore
-        if self._linkType!=LINKTYPE_FOLDER_SHORTCUT:
-            self._isDirectory=os.path.isdir(self.targetPath)
-
-    def refreshInfo(self,force:bool=True)->typing.Optional[str]:
+    def refreshInfo(self,force:bool=True)->None:
         """
         Called automatically as needed, but you can call
         this manually before an operation if you suspect the
@@ -469,63 +454,58 @@ class WindowsLink:
         if self._loaded and not force:
             return
         self._targetPath=None
-        self._uncPath=None
-        self._workingDirectory=None
+        self._lnk=None
+        self._lnkFile=None
         self._linkType=LINKTYPE_NONLINK
-        self._description=None
-        self._iconPath=None
-        self._iconIndex=0
         self._isDirectory=False
-        self._isZipFile=False
         self._loaded=True
-        if self._path is None:
-            return
         path=self._path
-        if False:
-            desktop=shell.SHGetDesktopFolder()
-            try:
-                #if path.endswith('.lnk'):
-                #    path=path.rsplit('.',1)[0]
-                _,pidl,_=desktop.ParseDisplayName(None,None,path)
-            except Exception as e:
-                print('Path exists?',os.path.exists(path))
-                print('   ',path)
-                #msg='ERR inspecting '+osEnquote(path)+':\n\t'+str(e)
-                #raise LinkException(msg) # TODO: I've found this can be a problem with filenames containing unicode characters # noqa: E501
-                pidl=SHParseDisplayName(path)
-            shell_item =shell.SHCreateShellItem(None,None,pidl)
-            attrs=shell_item.GetAttributes(shellcon.SFGAO_STREAM|shellcon.SFGAO_LINK|shellcon.SFGAO_FOLDER) # noqa: E501
-            self._isDirectory=attrs&shellcon.SFGAO_FOLDER>0
-            isLink=attrs&shellcon.SFGAO_LINK>0
-            self._isZipFile=(attrs&shellcon.SFGAO_STREAM)>0 and (attrs&shellcon.SFGAO_FOLDER)>0 # noqa: E501
-        attrs=0
-        isLink=False
-        if True:
-            import win32file
-            try:
-                # see also:
-                #    https://docs.microsoft.com/en-us/windows/desktop/FileIO/file-attribute-constants
-                attrs=win32file.GetFileAttributesExW(path)[0]
-            except Exception as e:
-                print('ERR getting attributes for file:\n  ',path,file=sys.stderr) # noqa: E501
-                raise e
-            self._isDirectory=attrs&0x10>0
-            isLink=attrs&0x400>0 or path.lower().endswith('.lnk')
-            #print('0x%08x'%attrs,self._isDirectory,path)
-        if isLink:
-            # windows calls things links that for our purposes, shouldn't be
-            isLink=path.rsplit('.',1)[-1].lower() not in ['url','zip','pif']
-        if self.isDirectory:
-            path=self._getLinkTargetSlow(path)
+        withExtension=FilePath(str(path)+'.lnk')
+        if not _lexists(path) and _lexists(withExtension):
+            path=withExtension
+            self._path=path
+        try:
+            attrs=fileAttributes(path)
+        except OSError:
+            return # nonexistent, so not a link
+        isDir=attrs&0x10>0
+        isSymlink=path.pathlibPath.is_symlink()
+        lnkFile:typing.Optional[FilePath]=None
+        if isDir:
+            lnkFile=_folderShortcutTarget(path)
+            if lnkFile is not None:
+                self._linkType=LINKTYPE_FOLDER_SHORTCUT
+            elif isSymlink:
+                self._linkType=LINKTYPE_SYMBOLIC_LINK
+            elif attrs&0x400>0:
+                self._linkType=LINKTYPE_JUNCTION
+        elif WindowsLnkFormat.isShortcut(path):
+            lnkFile=path
+            self._linkType=LINKTYPE_SHORTCUT
+        elif isSymlink:
+            self._linkType=LINKTYPE_SYMBOLIC_LINK
+        if lnkFile is not None:
+            self._lnkFile=lnkFile
+            self._lnk=WindowsLnkFormat(lnkFile)
+            target=self._lnk.getTarget()
+            if self._linkType==LINKTYPE_FOLDER_SHORTCUT:
+                self._isDirectory=True
+            elif target is not None and target.exists():
+                self._isDirectory=target.isDirectory
+            else:
+                self._isDirectory=self._lnk.fileAttr.targetIsDir
+        elif self._linkType!=LINKTYPE_NONLINK:
+            # resolve() follows symlinks and junctions
+            self._targetPath=FilePath(str(path.pathlibPath.resolve()))
+            self._isDirectory=isDir
         else:
-            path=self._getLinkTarget(path)
-        return path
+            self._isDirectory=isDir
 
     @staticmethod
     def createLink(
-        toLocation:typing.Optional[str],
-        linkType:int=LINKTYPE_SHORTCUT,
-        shortcutName:typing.Optional[str]=None,
+        toLocation:typing.Optional[UrlCompatible],
+        linkType:typing.Optional[int]=LINKTYPE_SHORTCUT,
+        shortcutName:typing.Optional[UrlCompatible]=None,
         sanitize:bool=True,
         dry:bool=False
         )->typing.Optional['WindowsLink']:
@@ -542,84 +522,76 @@ class WindowsLink:
         :param dry: perform dry run for testing -- aka, don't actually
             create anything
         """
+        if linkType is None:
+            linkType=LINKTYPE_SHORTCUT
+        if toLocation is None:
+            raise LinkException("Cannot create link without a target location")
+        target=asFilePath(toLocation)
         if shortcutName is None:
-            if toLocation is None:
-                raise LinkException("Cannot create link without a target location")
-            while True:
-                shortcutName=toLocation.rsplit(os.sep,1)[-1]
-                if shortcutName!='':
-                    break
+            shortcutName=FilePath(target.name)
+        newPath=asFilePath(shortcutName).absolute()
         if sanitize:
-            shortcutName=WindowsLink._sanitizedName(shortcutName)
-        shortcutName=nextAvailableFilename(shortcutName)
-        shortcutName=pathToUnc(shortcutName)
+            newPath=WindowsLink._sanitizedName(newPath)
+        if linkType==LINKTYPE_SHORTCUT and newPath.extension!='lnk':
+            newPath=FilePath(str(newPath)+'.lnk')
+        newPath=nextAvailableFilename(newPath)
         if dry:
-            print('creating '+LINK_TYPES[linkType]+' link from',shortcutName,'to',toLocation) # noqa: E501
-        elif linkType==LINKTYPE_SHORTCUT:
-            # create using WShell com object.  See also:
-            #    https://docs.microsoft.com/en-us/previous-versions//aew9yb99(v=vs.85)
-            #    http://www.informit.com/articles/article.aspx?p=1187429&seqNum=5
-            if not shortcutName.endswith('.lnk'):
-                # add .lnk file extension if necessary
-                shortcutName=shortcutName+'.lnk'
-            import win32com.client
-            ws=win32com.client.Dispatch("WScript.Shell")
-            shortcut=ws.CreateShortCut(shortcutName)
-            shortcut.Targetpath=toLocation
-            #shortcut.WorkingDirectory=
-            #shortcut.IconLocation=
-            #shortcut.Arguments=
-            #shortcut.Description=
-            #shortcut.Hotkey=
-            #shortcut.WindowStyle=
-            shortcut.Save()
+            print('creating '+LINK_TYPES[linkType]+' link from',newPath,'to',target) # noqa: E501
+            return None
+        if linkType==LINKTYPE_SHORTCUT:
+            lnk=WindowsLnkFormat()
+            lnk.setTarget(toLocation,*WindowsLink._targetInfo(toLocation))
+            lnk.save(newPath,noClobberFile=False)
+        elif linkType==LINKTYPE_FOLDER_SHORTCUT:
+            newPath.pathlibPath.mkdir()
+            lnk=WindowsLnkFormat()
+            lnk.setTarget(toLocation,*WindowsLink._targetInfo(toLocation))
+            lnk.save(newPath/_FOLDER_SHORTCUT_TARGET,noClobberFile=False)
+            ini=newPath/_FOLDER_SHORTCUT_INI
+            ini.pathlibPath.write_bytes(('[.ShellClassInfo]\r\nCLSID2='\
+                +_FOLDER_SHORTCUT_CLSID+'\r\nFlags=2\r\n').encode('utf-16'))
+            _winAttrib(ini,['+s','+h'])
+            _winAttrib(newPath,['+r']) # the shell needs this to honor desktop.ini # noqa: E501
+        elif linkType==LINKTYPE_SYMBOLIC_LINK:
+            newPath.symlink_to(target,target.isDirectory)
+        elif linkType==LINKTYPE_HARD_LINK:
+            os.link(str(target),str(newPath))
+        elif linkType==LINKTYPE_JUNCTION:
+            if os.name!='nt':
+                raise LinkException('ERR: Junctions only exist on windows')
+            result=subprocess.run(
+                ['cmd','/c','mklink','/j',str(newPath),str(target)],
+                capture_output=True,check=False)
+            if result.returncode!=0:
+                err=result.stderr.decode('utf-8','ignore').strip()
+                raise LinkException('ERR creating link: '+err)
         else:
-            toLocationUNC=osEnquote(pathToUnc(toLocation))
-            if linkType==LINKTYPE_FOLDER_SHORTCUT:
-                cmd='mklink /d '+shortcutName+' '+toLocationUNC
-            elif linkType==LINKTYPE_JUNCTION:
-                cmd='mklink /j '+shortcutName+' '+toLocationUNC
-            elif linkType==LINKTYPE_HARD_LINK:
-                cmd='mklink /h '+shortcutName+' '+toLocationUNC
-            elif linkType==LINKTYPE_SYMBOLIC_LINK:
-                cmd='mklink '+shortcutName+' '+toLocationUNC
-            else:
-                raise LinkException("Cannot create links of type "+str(linkType)) # noqa: E501
-            print(cmd)
-            po=subprocess.Popen(cmd,shell=True,
-                stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-            out,err=po.communicate()
-            err=err.decode('utf-8','ignore').strip()
-            if err:
-                print(cmd)
-                raise LinkException("ERR creating link: "+err)
-            print(out)
-        return WindowsLink(shortcutName)
+            raise LinkException("Cannot create links of type "+str(linkType))
+        return WindowsLink(newPath)
 
     def __repr__(self)->str:
         """
         Get a string representation of this link
         """
         self.refreshInfo(False)
-        ret:typing.List[str]=[osEnquote(self.path)]
+        ret:typing.List[str]=[str(osEnquote(str(self.path)))]
         ret.append('Type: '+LINK_TYPES[self.linkType])
-        if self.targetPath is not None and self.targetPath:
-            ret.append('Target: '+osEnquote(self.targetPath))
-        if self.uncPath is not None and self.uncPath:
+        ret.append('Target: '+str(osEnquote(str(self.targetPath))))
+        if self.uncPath:
             ret.append('UNC: '+self.uncPath)
-        if self.isDirectory is not None:
-            ret.append('Is Directory: '+str(self.isDirectory))
-        if self.iconPath is not None and self.iconPath:
-            ret.append(
-                'Icon: '+osEnquote(self.iconPath)+'['+str(self.iconIndex)+']')
-        if self.workingDirectory is not None and self.workingDirectory:
-            ret.append('Working Directory: '+osEnquote(self.workingDirectory))
-        if self.description is not None and self.description:
+        ret.append('Is Directory: '+str(self.isDirectory))
+        if self.iconPath:
+            ret.append('Icon: '+str(osEnquote(self.iconPath))\
+                +'['+str(self.iconIndex)+']')
+        if self.workingDirectory is not None:
+            ret.append('Working Directory: '\
+                +str(osEnquote(str(self.workingDirectory))))
+        if self.description:
             ret.append('Description: "'+self.description+'"')
         return '\n   '.join(ret)
 
     @staticmethod
-    def _sanitizedName(path:str)->str:
+    def _sanitizedName(path:UrlCompatible)->FilePath:
         """
         given a path to a shortcut, returns a sanitized name,
         that is, no "Shortcut To myfile" or "myfile - Shortcut"
@@ -628,17 +600,13 @@ class WindowsLink:
         """
         shortcutTo='Shortcut To '
         shortcut=' - Shortcut'
-        # disassemble
-        pathParts=path.rsplit(os.sep,1)
-        pathParts[-1]=pathParts[-1].split('.',1)
-        # fixup
-        if pathParts[-1][0].startswith(shortcutTo):
-            pathParts[-1][0]=pathParts[-1][0].rsplit(shortcutTo,1)[-1]
-        if pathParts[-1][0].endswith(shortcut):
-            pathParts[-1][0]=pathParts[-1][0].split(shortcut,1)[0]
-        # reassemble
-        pathParts[-1]='.'.join(pathParts[-1])
-        return os.sep.join(pathParts)
+        p=asFilePath(path).absolute()
+        nameParts=p.name.split('.',1)
+        if nameParts[0].startswith(shortcutTo):
+            nameParts[0]=nameParts[0].rsplit(shortcutTo,1)[-1]
+        if nameParts[0].endswith(shortcut):
+            nameParts[0]=nameParts[0].split(shortcut,1)[0]
+        return p.parent/'.'.join(nameParts)
 
     def delete(self,dry:bool=False)->None:
         """
@@ -648,9 +616,9 @@ class WindowsLink:
         """
         if self.linkType==LINKTYPE_NONLINK:
             if dry:
-                print('Will delete shortcut',osEnquote(self.path))
+                print('Will delete',osEnquote(str(self.path)))
             else:
-                os.remove(self.path)
+                self.path.remove()
         else:
             self.deleteLink(dry)
 
@@ -664,33 +632,34 @@ class WindowsLink:
         NOTE: from here on out this object is invalid!
         """
         if not self.isLink:
-            raise LinkException('ERR not a shortcut: '+osEnquote(self.path))
+            raise LinkException('ERR not a shortcut: '+str(self.path))
         if dry:
-            print('Will delete shortcut',osEnquote(self.path))
-        else:
-            if os.path.isdir(self.path): # folder shortcut
-                # turns out there is no need to remove these manually
-                #os.remove(path+os.sep+'target.lnk')
-                #os.remove(path+os.sep+'desktop.ini')
-                os.rmdir(self.path)
-            else:
-                os.remove(self.path)
+            print('Will delete shortcut',osEnquote(str(self.path)))
+        elif self.linkType==LINKTYPE_FOLDER_SHORTCUT:
+            for name in (_FOLDER_SHORTCUT_TARGET,_FOLDER_SHORTCUT_INI):
+                f=self.path/name
+                f.pathlibPath.chmod(0o666)
+                f.remove()
+            self.path.pathlibPath.chmod(0o777)
+            self.path.remove()
+        else: # file, or directory symlink/junction
+            self.path.remove()
 
 
 def createLink(
-    toLocation:str,
+    toLocation:UrlCompatible,
     linkType:typing.Optional[int]=None,
-    shortcutName:typing.Optional[str]=None,
+    shortcutName:typing.Optional[UrlCompatible]=None,
     sanitize:bool=True,
     dry:bool=False
-    )->WindowsLink:
+    )->typing.Optional[WindowsLink]:
     """
     Create a new link/shortcut
     (shorthand for WindowsLink.createLink)
 
     :param toLocation: the destination of the link (supports UNC names)
     :param linkType: the type of link to create
-        by default create either a normal shortcut or a folder shortcut
+        by default create a normal shortcut
     :param shortcutName: Name for the new link.
         If omitted, make it the same name as the target
     :param sanitize: remove any "Shortcut To X" and "X - Shortcut" nonsense
@@ -700,153 +669,61 @@ def createLink(
         toLocation,linkType,shortcutName,sanitize,dry)
 
 
-def cmdline(args:typing.Iterable[str])->int:
+def createShortcut(
+    inDir:UrlCompatible,
+    target:UrlCompatible,
+    name:typing.Optional[str]=None,
+    description:typing.Optional[str]=None,
+    icon:typing.Optional[str]=None,
+    hotkey:typing.Optional[int]=None
+    )->WindowsLink:
     """
-    Run the command line
+    Create a .lnk file
 
-    :param args: command line arguments (WITHOUT the filename)
+    :param inDir: directory to create the shortcut in
+    :param target: what the shortcut points to
+    :param name: name of the shortcut (default is the target's name)
+    :param description: shortcut description
+    :param icon: icon location
+    :param hotkey: raw shortcut hotkey value
     """
-    printhelp=False
-    if not args:
-        printhelp=True
-    else:
-        dry=False
-        for arg in args:
-            if arg.startswith('-'):
-                arg=[a.strip() for a in arg.split('=',1)]
-                if arg[0] in ['-h','--help']:
-                    printhelp=True
-                elif arg[0]=='-D':
-                    dry=True
-                elif arg[0]=='--toFolderShortcut':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        l.linkType=LINKTYPE_FOLDER_SHORTCUT
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--toNormalShortcut':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        l.linkType=LINKTYPE_SHORTCUT
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--deleteLink':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        l.deleteLink(dry=dry)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--createShortcut':
-                    if len(arg)>1:
-                        WindowsLink.createLink(arg[1],1)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--createFolderShortcut':
-                    if len(arg)>1:
-                        WindowsLink.createLink(arg[1],2)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--createJunction':
-                    if len(arg)>1:
-                        WindowsLink.createLink(arg[1],3)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--createHardLink':
-                    if len(arg)>1:
-                        WindowsLink.createLink(arg[1],4)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--createSoftLink':
-                    if len(arg)>1:
-                        WindowsLink.createLink(arg[1],5)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--shortcutTarget':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        print(l.targetPath)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--isFolderShortcut':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        print(l.linkType==LINKTYPE_FOLDER_SHORTCUT)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--isShortcut':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        print(l.linkType!=LINKTYPE_NONLINK)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--isShortcutToFolder':
-                    if len(arg)>1:
-                        l=WindowsLink(arg[1])
-                        print(l.linkType!=LINKTYPE_NONLINK and l.isDirectory)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                elif arg[0]=='--info':
-                    if len(arg)>1:
-                        filename=arg[1]
-                        l=WindowsLink(filename)
-                        print(l)
-                    else:
-                        print('ERR: no path specified')
-                        printhelp=True
-                        break
-                else:
-                    print('ERR: unknown argument "'+arg[0]+'"')
-                    printhelp=True
-                    break
-            else:
-                print('ERR: unknown argument "'+arg+'"')
-                printhelp=True
-                break
-    if printhelp:
-        print('Usage:')
-        print('  windowsLinks.py [options] [commands]')
-        print('Options/commands (evaluated IN ORDER!):')
-        print('   -D ............................. perform dry-run, not changing anything') # noqa: E501
-        print('   --toFolderShortcut=path ........ turn a link to folder into a "folder shortcut"') # noqa: E501
-        print('   --toNormalShortcut=path ........ turn a link, "folder shortcut", etc into a normal shortcut') # noqa: E501
-        print('   --deleteLink=path .............. delete (only) a link (never the actual file)') # noqa: E501
-        print('   --createShortcut=target ........ create a regular shortcut link') # noqa: E501
-        print('   --createFolderShortcut=target .. create a folder shortcut link') # noqa: E501
-        print('   --createJunction=target ........ create a junction point link') # noqa: E501
-        print('   --createHardLink=target ........ create a hard link')
-        print('   --createSoftLink=target ........ create a soft link')
-        print('   --shortcutTarget=path .......... get the target of a link')
-        print('   --isFolderShortcut=path ........ is this a "folder link"')
-        print('   --isShortcut=path .............. is this any kind of link')
-        print('   --isShortcutToFolder=path ...... is this any kind of link to a folder') # noqa: E501
-        print('   --info=path .................... get info about link')
-        return -1
-    return 0
+    if name is None:
+        name=asFilePath(target).name
+    link=WindowsLink.createLink(
+        target,LINKTYPE_SHORTCUT,asFilePath(inDir)/name,False)
+    assert link is not None
+    if description is not None:
+        link.description=description
+    if icon is not None:
+        link.iconPath=icon
+    if hotkey is not None:
+        link.hotKey=hotkey
+    return link
 
-if __name__=='__main__':
-    import sys
-    sys.exit(cmdline(sys.argv[1:]))
+
+def finalPath(path:UrlCompatible,absolute:bool=False)->FilePath:
+    """
+    Returns either the path given, or if it's a link, the path it points to
+
+    * Will follow link-to-a-links
+
+    Could raise RecursiveLinkException
+
+    :param path: the path to resolve
+    :param absolute: True/False return the result as an absolute path
+    """
+    followed:typing.List[str]=[]
+    current=asFilePath(path)
+    while True:
+        absolutePath=str(current.absolute())
+        if absolutePath in followed:
+            followed.append(absolutePath)
+            raise RecursiveLinkException(followed)
+        followed.append(absolutePath)
+        link=WindowsLink(current)
+        if not link.isLink or str(link.targetPath)==str(link.path):
+            break
+        current=link.targetPath
+    if absolute:
+        return current.absolute()
+    return current
